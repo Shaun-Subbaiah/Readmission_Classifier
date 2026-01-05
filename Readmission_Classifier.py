@@ -7,19 +7,32 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score, confusion_matrix, precision_score, recall_score, f1_score, roc_curve
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore')     # Put it in to make the output cleaner and to get rid of those extra messages
 
 
 class ReadmissionClassifier:
     """Class to handle all the diabetes readmission classification tasks"""
     
-    def __init__(self, csv_file, random_state=42):
+    def __init__(self, csv_file, readmit_weight=12, random_state=42):
+        """
+        - Initialization - 
+        readmit_weight:
+            I tested different weights and this was what I got, based on which I felt 12 was optimal, feel free to change based on needs:
+            Weight 8:  Precision ~18%, Recall ~55% (conservative)
+            Weight 10: Precision ~16%, Recall ~68% (balanced)
+            Weight 12: Precision ~14%, Recall ~82% (recommended)
+            Weight 15: Precision ~12%, Recall ~92% (aggressive)
+            
+        random_state :
+            Just a random seed for reproducibility, I chose 42 because it's the answer to everything : )
+        """
         self.csv_file = csv_file
-        self.data = None
+        self.readmit_weight = readmit_weight
         self.random_state = random_state
+        self.data = None
         
     def load_data(self):
-        """Load the dataset and set up the target variable"""
+        """Load the dataset and sets up target variable"""
         try:
             self.data = pd.read_csv(self.csv_file)
             self.data = self.data.replace('?', np.nan)
@@ -27,42 +40,95 @@ class ReadmissionClassifier:
             if 'readmitted' not in self.data.columns:
                 raise ValueError("'readmitted' column not found")
             
-            # Create binary target for ML, 1 if readmitted within 30 days, else 0
             self.data['target'] = (self.data['readmitted'] == '<30').astype(int)
-            
             print(f"Loading data... (check) ({len(self.data):,} patients)")
             
         except FileNotFoundError:
             print(f"Error: {self.csv_file} not found.")
             raise
     
+    def group_diagnosis(self, diag_code):
+        """Group the diagnosis codes into relevant categories"""
+        if pd.isna(diag_code):
+            return 'Unknown'
+        
+        diag_code = str(diag_code)
+        
+        # Extract number part
+        if diag_code.startswith('V') or diag_code.startswith('E'):
+            return 'Other'
+        
+        try:
+            code_num = float(diag_code)
+        except:
+            return 'Other'
+        
+        # Group into disease categories
+        if 390 <= code_num < 460 or code_num == 785:
+            return 'Circulatory'
+        elif 460 <= code_num < 520 or code_num == 786:
+            return 'Respiratory'
+        elif 520 <= code_num < 580 or code_num == 787:
+            return 'Digestive'
+        elif 250 <= code_num < 251:
+            return 'Diabetes'
+        elif 800 <= code_num < 1000:
+            return 'Injury'
+        elif 710 <= code_num < 740:
+            return 'Musculoskeletal'
+        elif 580 <= code_num < 630 or code_num == 788:
+            return 'Genitourinary'
+        elif 140 <= code_num < 240:
+            return 'Neoplasms'
+        else:
+            return 'Other'
+    
     def prepare_features(self):
-        """Get our features ready - encoding and cleaning"""
+        """Prepare features with encoding, engineering, and cleaning"""
         print("Preparing features...")
         
-        # Core features for prediction
-        features = ['age', 'gender', 'time_in_hospital', 'num_medications', 
-                   'number_inpatient', 'number_emergency', 'num_lab_procedures',
-                   'change', 'diabetesMed']
+        # List of features
+        features = [
+            'age', 'gender', 'time_in_hospital', 'num_medications',
+            'number_inpatient', 'number_emergency', 'number_outpatient',
+            'num_lab_procedures', 'num_procedures', 'number_diagnoses',
+            'change', 'diabetesMed', 'A1Cresult', 'max_glu_serum'
+        ]
         
-        # Only use features that exist
         features = [f for f in features if f in self.data.columns]
         X = self.data[features].copy()
         
-        # Age made to numbers for ordering 
+        # Age range to value conversion
         if 'age' in X.columns:
             age_map = {'[0-10)': 0, '[10-20)': 1, '[20-30)': 2, '[30-40)': 3,
                       '[40-50)': 4, '[50-60)': 5, '[60-70)': 6, '[70-80)': 7,
                       '[80-90)': 8, '[90-100)': 9}
             X['age'] = X['age'].map(age_map)
         
-        # One-hot encoding - usefull
-        cat_features = ['gender', 'change', 'diabetesMed']
-        cat_features = [f for f in cat_features if f in X.columns]
+        # Feature engineering - clinical risk indicators
+        if 'number_inpatient' in self.data.columns and 'number_emergency' in self.data.columns:
+            X['high_utilization'] = (
+                (self.data['number_inpatient'] >= 1) |              # Any prior readmission could be a strong indicator for readmission but this could be changed to 2 to make it a bit stricter
+                (self.data['number_emergency'] >= 2)                # 2 or more ER visits could indicate something more chronic
+            ).astype(int)
+        
+        if 'num_medications' in self.data.columns:
+            X['polypharmacy'] = (self.data['num_medications'] >= 10).astype(int)         # Although 10+ meds is considered polypharmacy, I felt 10+ meds is more defined and showes a more sivere case of polypharmacy
+        
+        if 'time_in_hospital' in self.data.columns:
+            X['long_stay'] = (self.data['time_in_hospital'] >= 7).astype(int)            # 7+ days is a quite a long stay and could indicate complications
+        
+        # Add grouped primary diagnosis
+        if 'diag_1' in self.data.columns:
+            X['primary_diagnosis'] = self.data['diag_1'].apply(self.group_diagnosis)
+        
+        # Convert categories into numeric values - needed for ML learining
+        cat_features = [f for f in ['gender', 'change', 'diabetesMed', 'A1Cresult', 
+                                     'max_glu_serum', 'primary_diagnosis'] if f in X.columns]
         if cat_features:
             X = pd.get_dummies(X, columns=cat_features, drop_first=True)
         
-        # Fill missing values with median
+        # Fill missing values
         X = X.fillna(X.median())
         
         return X, self.data['target']
@@ -83,53 +149,47 @@ class ReadmissionClassifier:
         Easy cases: Very short stays (<=2 days) or very long stays (>=10 days)
         Hard cases: Medium stays (4-7 days) where readmission risk is ambiguous
         
-        Train on easy cases and test on hard cases. The main goal is to see if the model can help with the tough clinical decisions
-        """
-        los = self.data['time_in_hospital'].values
-        
+        Train on easy cases and test on hard cases. The main goal is to see if the model can help with the tough clinical decisions."""
+
         # Difficulty based on length of stay
-        easy_case = (los <= 2) | (los >= 10)
-        hard_case = (los >= 4) & (los <= 7)
-        
-        print("\nDifficulty-Based Validation")   # Basically testing the model on ambiguous cases where it matters most
-        print(f"  Clear cases: {easy_case.sum():,} patients")
-        print(f"  Ambiguous cases: {hard_case.sum():,} patients")    #These are basically patients that are NOT easy or hard cases (<=2 or >=10 days), instead they are the in between cases which are harder to diagnose (>=4 and <=7 days)
-        
-        # Train on clear cases, test on ambiguous ones
-        X_train = X[easy_case]
-        y_train = y[easy_case]
-        X_test = X[hard_case]
-        y_test = y[hard_case]
+        los = self.data['time_in_hospital'].values
+        easy_mask = (los <= 2) | (los >= 10)                                   # 2 or less days likely means a less sivere case, 10 or more days likely indicates a complex case (clear cases)
+        hard_mask = (los >= 4) & (los <= 7)                                    # 4-7 days is more ambiguous and could be cases that are harder to predict (ambiguous cases)
+         
+        print("\nDifficulty-Based Validation")                                 # Basically testing the model on ambiguous cases where it matters most
+        print(f"  Clear cases: {easy_mask.sum():,} patients")
+        print(f"  Ambiguous cases: {hard_mask.sum():,} patients")              # These are basically patients that are NOT easy or hard cases (<=2 or >=10 days), instead they are the in between cases which are harder to diagnose (>=4 and <=7 days)
+
         
         model = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=12,
-            class_weight='balanced',
+            n_estimators=200,             # felt 200 trees was a good balance of speed and performance
+            max_depth=12,                 # again 12 levels was a good balance
+            class_weight={0: 1, 1: self.readmit_weight},
             random_state=self.random_state,
             n_jobs=-1
         )
         
-        model.fit(X_train, y_train)
-        y_pred_proba = model.predict_proba(X_test)[:, 1]
-        auc = roc_auc_score(y_test, y_pred_proba)
+        model.fit(X[easy_mask], y[easy_mask])
+        y_pred_proba = model.predict_proba(X[hard_mask])[:, 1]
+        auc = roc_auc_score(y[hard_mask], y_pred_proba)
         
         print(f"  AUC on ambiguous cases: {auc:.3f}")
+    
         
         return auc
     
     def train_model(self, X, y, model_type):
-        """Train and check a model"""
+        """Train and evaluate a model, has adjustable class weights"""
         
-        # Split data while maintaining class distribution
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=self.random_state, stratify=y
+            X, y, test_size=0.2, random_state=self.random_state, stratify=y             # 80/20 is pretty common, 20k should be enough for training I feel
         )
         
-        # Model setup -> balanced weights
+        # Model setup -> balanced weights but they are adjustabel
         if model_type == 'lr':
             model = LogisticRegression(
-                class_weight='balanced',
-                max_iter=1000,
+                class_weight={0: 1, 1: self.readmit_weight},
+                max_iter=1000,                       # 1000 to ensure convergence
                 random_state=self.random_state
             )
             name = 'Logistic Regression'
@@ -137,20 +197,16 @@ class ReadmissionClassifier:
             model = RandomForestClassifier(
                 n_estimators=200,
                 max_depth=12,
-                class_weight='balanced',
+                class_weight={0: 1, 1: self.readmit_weight},
                 random_state=self.random_state,
                 n_jobs=-1
             )
             name = 'Random Forest'
         
-        # Train the model
         model.fit(X_train, y_train)
-        
-        # Make predictions
         y_pred = model.predict(X_test)
         y_pred_proba = model.predict_proba(X_test)[:, 1]
         
-        # The metrics
         return {
             'model': model,
             'name': name,
@@ -168,14 +224,13 @@ class ReadmissionClassifier:
         """Print results of the info + plotting the relavant graphs"""
         
         print("\n ~ RESULTS ~")
-        
-        # Single model results
+
+        # Single model results        
         if len(results) == 1:
             r = list(results.values())[0]
             print(f"Model: {r['name']}")
             print(f"AUC: {r['auc']:.3f}")
             print(f"Precision: {r['precision']:.0%} | Recall: {r['recall']:.0%} | F1: {r['f1']:.0%}")
-            
             self.plot_single(r)
         
         # Both models comparison
@@ -193,7 +248,6 @@ class ReadmissionClassifier:
                     best_name = r['name']
             
             print(f"\nBest: {best_name} (AUC: {best_auc:.3f})")
-            
             self.plot_comparison(results)
     
     def plot_single(self, result):
@@ -227,7 +281,6 @@ class ReadmissionClassifier:
             axes[1].set_yticks([0, 1])
             axes[1].set_xticklabels(['No Readmit', 'Readmit'])
             axes[1].set_yticklabels(['No Readmit', 'Readmit'])
-        
         else:
             # Just confusion matrix for Logistic Regression
             fig, ax = plt.subplots(figsize=(6, 5))
@@ -250,8 +303,7 @@ class ReadmissionClassifier:
         plt.show()
     
     def plot_comparison(self, results):
-        """Create comparison plots for both models"""
-        
+        """Create comparison plots for both models"""        
         fig, axes = plt.subplots(1, 2, figsize=(12, 4))
         
         # ROC curves
@@ -285,21 +337,17 @@ class ReadmissionClassifier:
         """Run the complete program to analyze data"""
         
         print("-- DIABETES READMISSION CLASSIFIER --")
-       
-        # Load data
+    
+        #Load data
         self.load_data()
-        
-        # model choice
         model_choice = self.get_user_input()
-        
-        # Prepare features
         X, y = self.prepare_features()
         
-        # Run the difficulty validation but only for Random Forest
+        # Run difficulty validation for rf
         if model_choice in ['rf', 'both']:
             self.difficulty_validation(X, y)
         
-        # Train model/s
+        # Train models
         results = {}
         
         if model_choice in ['lr', 'both']:
@@ -310,17 +358,14 @@ class ReadmissionClassifier:
             print("Training Random Forest...")
             results['rf'] = self.train_model(X, y, 'rf')
         
-        # Show results
         self.show_results(results)
-        
-        print("\n - Complete -")
+        print("\nAnalysis complete!")
 
 
 # Main
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python readmission_classifier.py <csv_file>")
-        print("Example: python readmission_classifier.py diabetic_data.csv")
         sys.exit(1)
     
     csv_file = sys.argv[1]
